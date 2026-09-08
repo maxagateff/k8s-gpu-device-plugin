@@ -79,7 +79,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		return fmt.Errorf("watch %s: %w", m.cfg.PluginPath, err)
 	}
 
-	kubeletSocket := filepath.Join(m.cfg.PluginPath, pluginapi.KubeletSocket)
+	kubeletSocket := filepath.Join(m.cfg.PluginPath, filepath.Base(pluginapi.KubeletSocket))
 
 	for {
 		select {
