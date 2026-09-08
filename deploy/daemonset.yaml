@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: DaemonSet
+
+metadata:
+  name: k8s-gpu-device-plugin
+  namespace: kube-system
+
+spec:
+  selector:
+    matchLabels:
+      app: k8s-gpu-device-plugin
+
+  template:
+    metadata:
+      labels:
+        app: k8s-gpu-device-plugin
+
+    spec:
+      containers:
+        - name: k8s-gpu-device-plugin
+          image: ghcr.io/maxagateff/k8s-gpu-device-plugin:latest
+          imagePullPolicy: Always
+
+          env:
+            - name: GPU_RESOURCE_DOMAIN
+              value: gpu.local
+
+            - name: GPU_PLUGIN_PATH
+              value: /var/lib/kubelet/device-plugins
+
+          securityContext:
+            privileged: true
+
+          volumeMounts:
+            - name: device-plugins
+              mountPath: /var/lib/kubelet/device-plugins
+
+            - name: cdi-etc
+              mountPath: /etc/cdi
+              readOnly: true
+
+            - name: cdi-run
+              mountPath: /var/run/cdi
+              readOnly: true
+
+      volumes:
+        - name: device-plugins
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory
+
+        - name: cdi-etc
+          hostPath:
+            path: /etc/cdi
+            type: DirectoryOrCreate
+
+        - name: cdi-run
+          hostPath:
+            path: /var/run/cdi
+            type: DirectoryOrCreate
