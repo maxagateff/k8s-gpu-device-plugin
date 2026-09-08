@@ -1102,7 +1102,7 @@ k8s-gpu-device-plugin/
 └── docs.md
 ```
 
-## `main.go`
+## `../src/main.go`
 
 Application entry point and config.
 
@@ -1117,7 +1117,7 @@ dependency wiring
 Manager startup
 ```
 
-## `gpu.go`
+## `../src/gpu.go`
 
 GPU/NVML layer.
 
@@ -1132,7 +1132,7 @@ NVML health monitoring
 health recovery
 ```
 
-## `cdi.go`
+## `../src/cdi.go`
 
 CDI abstraction.
 
@@ -1144,7 +1144,7 @@ nvidia.com/gpu=<UUID>
 
 against the host CDI cache.
 
-## `plugin.go`
+## `../src/plugin.go`
 
 Kubernetes Device Plugin implementation.
 
@@ -1159,7 +1159,7 @@ health state
 plugin socket lifecycle
 ```
 
-## `manager.go`
+## `../src/manager.go`
 
 Top-level lifecycle coordinator.
 
