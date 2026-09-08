@@ -26,7 +26,6 @@ type KubeletRegistrar struct{ pluginPath string }
 func (r *KubeletRegistrar) Register(ctx context.Context, endpoint, resourceName string, options *pluginapi.DevicePluginOptions) error {
 	kubeletSocket := filepath.Join(r.pluginPath, filepath.Base(pluginapi.KubeletSocket))
 
-
 	if err := checkSocket(kubeletSocket); err != nil {
 		return fmt.Errorf("kubelet socket: %w", err)
 	}

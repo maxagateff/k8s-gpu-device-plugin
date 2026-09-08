@@ -1,14 +1,14 @@
 # k8s-gpu-device-plugin
 
-`k8s-gpu-device-plugin` is a Kubernetes Device Plugin for NVIDIA GPUs that exposes individual GPU models as separate Kubernetes extended resources.
+`k8s-gpu-device-plugin` is a Kubernetes Device Plugin for NVIDIA GPUs that exposes physical GPUs as **model-specific Kubernetes extended resources** and allocates the selected devices to containers through CDI.
 
-Instead of advertising every GPU under a single resource such as:
+Instead of advertising every NVIDIA GPU through a single generic resource:
 
 ```text
 nvidia.com/gpu
 ```
 
-the plugin discovers the actual GPU model installed on the node and registers a resource for each model:
+the plugin discovers the actual GPU models installed on each node and exposes resources such as:
 
 ```text
 gpu.local/rtx-3060-ti
@@ -17,17 +17,29 @@ gpu.local/rtx-4090
 gpu.local/a100-sxm4-40gb
 ```
 
-This allows workloads to request a specific GPU model using standard K8s resource limits.
-
-For example:
+A workload can therefore request a specific GPU model using the standard Kubernetes resource mechanism:
 
 ```yaml
 resources:
   limits:
-    gpu.local/rtx-4090: 1
+    gpu.local/rtx-3060-ti: 1
 ```
 
-The plugin handles GPU discovery, UUID tracking, model grouping, kubelet registration, allocation validation, CDI device injection, health monitoring, and socket recovery.
+The plugin handles:
+
+- NVML-based GPU discovery
+- GPU UUID tracking
+- model normalization
+- model-specific resource registration
+- kubelet Device Plugin registration
+- CDI-backed device allocation
+- GPU health monitoring
+- `ListAndWatch` updates
+- kubelet re-registration
+- plugin socket recovery
+- graceful shutdown
+
+The intended deployment model is a **DaemonSet running on GPU nodes**.
 
 ---
 
@@ -35,47 +47,64 @@ The plugin handles GPU discovery, UUID tracking, model grouping, kubelet registr
 
 - [Overview](#overview)
 - [Why This Exists](#why-this-exists)
-- [Features](#features)
 - [Architecture](#architecture)
+- [Features](#features)
 - [Requirements](#requirements)
-- [Build](#build)
+- [Repository Layout](#repository-layout)
 - [Configuration](#configuration)
-- [Running the Plugin](#running-the-plugin)
+- [Building From Source](#building-from-source)
+- [Container Image](#container-image)
+- [CI and GHCR](#ci-and-ghcr)
+- [Kubernetes Deployment](#kubernetes-deployment)
 - [GPU Discovery](#gpu-discovery)
 - [Resource Naming](#resource-naming)
-- [Kubernetes Registration](#kubernetes-registration)
-- [Using GPUs in Workloads](#using-gpus-in-workloads)
-- [Multi-GPU Allocation](#multi-gpu-allocation)
+- [Device Plugin Registration](#device-plugin-registration)
+- [Requesting a GPU](#requesting-a-gpu)
 - [Allocation Flow](#allocation-flow)
+- [Multi-GPU Allocation](#multi-gpu-allocation)
 - [CDI Integration](#cdi-integration)
 - [Health Monitoring](#health-monitoring)
 - [kubelet Restart Handling](#kubelet-restart-handling)
 - [Plugin Socket Recovery](#plugin-socket-recovery)
 - [Duplicate GPU Protection](#duplicate-gpu-protection)
 - [Graceful Shutdown](#graceful-shutdown)
-- [Project Structure](#project-structure)
 - [Operational Checks](#operational-checks)
 - [Troubleshooting](#troubleshooting)
 - [Known Limitations](#known-limitations)
-- [Security Notes](#security-notes)
-- [Production Deployment](#production-deployment)
-- [Quick Start](#quick-start)
+- [Deployment Considerations](#deployment-considerations)
+- [End-to-End Validation](#end-to-end-validation)
+- [Design Summary](#design-summary)
 
 ---
 
 # Overview
 
-The plugin uses NVIDIA Management Library (NVML) to discover physical NVIDIA GPUs installed on a K8s node.
+The plugin runs on a Kubernetes GPU node and communicates with three node-local systems:
 
-For each GPU, it determines:
+```text
+NVIDIA Driver / NVML
+        |
+        v
+k8s-gpu-device-plugin
+        |
+        +------> kubelet Device Plugin API
+        |
+        +------> CDI device specifications
+```
 
-- GPU UUID
-- GPU model
-- Kubernetes resource name
-- NVIDIA CDI device name
-- current health state
+At startup, the plugin uses NVML to enumerate physical NVIDIA GPUs.
 
-Example physical node:
+For every GPU it obtains:
+
+```text
+GPU UUID
+GPU model
+Kubernetes resource name
+CDI device name
+health state
+```
+
+For example, a node containing:
 
 ```text
 GPU 0: NVIDIA GeForce RTX 3060 Ti
@@ -83,7 +112,7 @@ GPU 1: NVIDIA GeForce RTX 3060 Ti
 GPU 2: NVIDIA GeForce GTX 1660 SUPER
 ```
 
-The plugin groups those devices by model:
+is represented internally as:
 
 ```text
 gpu.local/rtx-3060-ti
@@ -94,48 +123,54 @@ gpu.local/gtx-1660-super
 └── GPU-UUID-C
 ```
 
-Kubernetes then sees:
+Kubernetes sees:
 
 ```text
 gpu.local/rtx-3060-ti:    2
 gpu.local/gtx-1660-super: 1
 ```
 
-The core invariant is:
+The core design invariant is:
 
 ```text
-1 Device Plugin instance
+1 Device Plugin endpoint
 =
-1 Kubernetes resourceName
+1 Kubernetes resource name
 =
-1..N physical GPUs of that model
+1..N physical GPUs of the same model
 ```
 
-A single physical GPU UUID must never be advertised by more than one resource.
+A physical GPU is identified by its NVML UUID and must not be advertised by multiple plugin resources.
 
 ---
 
 # Why This Exists
 
-The standard GPU resource model usually exposes NVIDIA GPUs through a generic resource:
+The conventional NVIDIA resource:
 
 ```text
 nvidia.com/gpu
 ```
 
-That works well when the exact GPU model doesn't matter.
+represents GPU quantity but doesn't inherently express the exact GPU model requested by a workload.
 
-It becomes less useful on heterogeneous nodes or clusters.
+That can be limiting in heterogeneous environments.
 
-For example, consider a node with:
+Consider a cluster containing:
 
 ```text
-1x RTX 4090
-2x RTX 3060 Ti
-1x GTX 1660 SUPER
+Node A
+└── RTX 4090
+
+Node B
+├── RTX 3060 Ti
+└── RTX 3060 Ti
+
+Node C
+└── GTX 1660 SUPER
 ```
 
-A workload requesting:
+A generic request:
 
 ```yaml
 resources:
@@ -143,9 +178,9 @@ resources:
     nvidia.com/gpu: 1
 ```
 
-doesn't express which GPU model it actually needs.
+doesn't describe whether the workload requires an RTX 4090, RTX 3060 Ti, or another GPU model.
 
-This plugin exposes the models separately:
+With this plugin, nodes can advertise:
 
 ```text
 gpu.local/rtx-4090:       1
@@ -153,7 +188,7 @@ gpu.local/rtx-3060-ti:    2
 gpu.local/gtx-1660-super: 1
 ```
 
-A workload can then explicitly request:
+and a workload can explicitly request:
 
 ```yaml
 resources:
@@ -161,117 +196,109 @@ resources:
     gpu.local/rtx-4090: 1
 ```
 
-This is useful for mixed GPU environments where model, VRAM size, compute capability, or workload placement matters.
+Kubernetes can then schedule the workload only onto a node that advertises the requested model.
 
----
-
-# Features
-
-Current functionality includes:
-
-- automatic NVIDIA GPU discovery via NVML
-- no hardcoded GPU UUIDs
-- no hardcoded GPU model list required
-- automatic model-to-resource conversion
-- configurable resource domain
-- one Device Plugin endpoint per GPU model
-- multiple physical GPUs per resource
-- multi-GPU allocation
-- UUID validation
-- resource ownership validation
-- GPU health validation
-- CDI device validation
-- NVIDIA CDI allocation
-- NVML XID monitoring
-- periodic health probes
-- `ListAndWatch` health updates
-- kubelet socket monitoring
-- automatic kubelet re-registration
-- plugin socket recovery
-- duplicate UUID protection
-- startup rollback
-- SIGINT/SIGTERM handling
-- graceful gRPC shutdown
-- testable interfaces for discovery, registration, and CDI resolution
+This is useful when GPU model, VRAM capacity, architecture, or workload placement matters.
 
 ---
 
 # Architecture
 
-At a high level:
+The plugin is a **node agent**, not a centralized GPU controller.
+
+A Kubernetes cluster should conceptually look like:
 
 ```text
-+-----------------------+
-|    NVIDIA Driver      |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-|         NVML          |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-|     GPU Discovery     |
-|                       |
-| UUID                   |
-| Model                  |
-| Health                 |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-|   Model Normalizer    |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-|   Resource Grouper    |
-+-----------+-----------+
-            |
-       +----+----+
-       |         |
-       v         v
+                       Kubernetes Control Plane
+                                |
+                                |
+                +---------------+---------------+
+                |                               |
+                v                               v
 
-gpu.local/       gpu.local/
-rtx-3060-ti      rtx-4090
+          GPU Node A                       GPU Node B
 
-GPU-A            GPU-C
-GPU-B
+       NVIDIA Driver                    NVIDIA Driver
+             |                                |
+            NVML                             NVML
+             |                                |
+             v                                v
 
-       |         |
-       v         v
+ k8s-gpu-device-plugin            k8s-gpu-device-plugin
+             |                                |
+             v                                v
 
-Device Plugin   Device Plugin
-gRPC endpoint   gRPC endpoint
-
-       \         /
-        \       /
-         v     v
-
-+-----------------------+
-|        kubelet        |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-|   Container Runtime   |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-|     NVIDIA CDI        |
-+-----------+-----------+
-            |
-            v
-+-----------------------+
-|       Container       |
-+-----------------------+
+          kubelet                          kubelet
+             |                                |
+             +---------------+----------------+
+                             |
+                             v
+                       Kubernetes API
 ```
 
-The `Manager` owns the plugin lifecycle.
+Each plugin instance only manages GPUs physically attached to its own node.
 
-Its main responsibilities are:
+The plugin talks to the local kubelet through:
+
+```text
+/var/lib/kubelet/device-plugins/kubelet.sock
+```
+
+The Kubernetes scheduler doesn't communicate with the plugin directly. It schedules against the extended resources reported by kubelet.
+
+---
+
+## Internal Architecture
+
+```text
+                    +------------------+
+                    |      Config      |
+                    +--------+---------+
+                             |
+                             v
+                    +------------------+
+                    |       NVML       |
+                    +--------+---------+
+                             |
+                             v
+                    +------------------+
+                    |   GPU Discovery  |
+                    +--------+---------+
+                             |
+                             v
+                    +------------------+
+                    |      Manager     |
+                    +--------+---------+
+                             |
+               +-------------+-------------+
+               |                           |
+               v                           v
+
+     gpu.local/rtx-3060-ti      gpu.local/gtx-1660-super
+
+          Device Plugin               Device Plugin
+          gRPC endpoint               gRPC endpoint
+
+               |                           |
+               +-------------+-------------+
+                             |
+                             v
+                          kubelet
+                             |
+                             v
+                         Allocate()
+                             |
+                             v
+                            CDI
+                             |
+                             v
+                    Container Runtime
+                             |
+                             v
+                         Workload
+```
+
+The `Manager` coordinates the node-level lifecycle:
 
 ```text
 Discover GPUs
@@ -283,19 +310,16 @@ Validate CDI devices
 Group GPUs by resource
     |
     v
-Create Device Plugins
+Create Device Plugin endpoints
     |
     v
-Start gRPC endpoints
-    |
-    v
-Register with kubelet
+Register resources with kubelet
     |
     +------> Monitor GPU health
     |
-    +------> Monitor kubelet.sock
+    +------> Watch kubelet.sock
     |
-    +------> Monitor plugin sockets
+    +------> Watch plugin sockets
     |
     v
 Graceful shutdown
@@ -303,17 +327,52 @@ Graceful shutdown
 
 ---
 
+# Features
+
+Current functionality includes:
+
+- automatic NVIDIA GPU discovery through NVML
+- no hardcoded GPU UUIDs
+- automatic model-to-resource conversion
+- configurable Kubernetes resource domain
+- one Device Plugin endpoint per GPU model
+- multiple physical GPUs under one model resource
+- multi-GPU allocation
+- UUID validation during allocation
+- resource ownership validation
+- duplicate device request detection
+- GPU health validation
+- CDI device validation
+- CDI-backed GPU injection
+- NVML XID critical error monitoring
+- periodic NVML health probes
+- delayed health recovery
+- `ListAndWatch` state propagation
+- kubelet socket monitoring
+- automatic kubelet re-registration
+- plugin socket recovery
+- duplicate UUID protection
+- startup rollback
+- SIGINT/SIGTERM handling
+- graceful gRPC shutdown
+- discovery, registration, and CDI abstractions for testability
+- container image build
+- GitHub Actions CI
+- GHCR image publishing
+- Kubernetes DaemonSet deployment
+
+---
+
 # Requirements
 
-The target K8s GPU node needs:
+A target GPU node needs:
 
 - Linux
-- Kubernetes / kubelet
+- Kubernetes with kubelet
 - NVIDIA GPU
 - NVIDIA driver
 - NVML
-- NVIDIA Container Toolkit
-- NVIDIA CDI configuration
+- NVIDIA Container Toolkit / CDI setup
 - a CDI-capable container runtime
 - access to the kubelet Device Plugin directory
 
@@ -323,13 +382,15 @@ The default Device Plugin directory is:
 /var/lib/kubelet/device-plugins
 ```
 
-## Check the NVIDIA driver
+## NVIDIA driver
+
+Verify the driver:
 
 ```bash
 nvidia-smi
 ```
 
-## List physical GPUs
+List physical GPUs:
 
 ```bash
 nvidia-smi -L
@@ -342,39 +403,231 @@ GPU 0: NVIDIA GeForce RTX 3060 Ti (UUID: GPU-...)
 GPU 1: NVIDIA GeForce GTX 1660 SUPER (UUID: GPU-...)
 ```
 
-## Check CDI
+## CDI
+
+List CDI devices:
 
 ```bash
 nvidia-ctk cdi list
 ```
 
-The output should contain GPU-specific devices similar to:
-
-```text
-nvidia.com/gpu=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-```
-
-The plugin expects CDI device names in this format:
+The plugin expects physical GPUs to have CDI names in the form:
 
 ```text
 nvidia.com/gpu=<GPU-UUID>
 ```
 
----
+For example:
 
-# Build
-
-Clone the repo:
-
-```bash
-git clone <repository-url>
-cd k8s-gpu-device-plugin
+```text
+nvidia.com/gpu=GPU-c0a1bd7d-9471-1ea3-0e5d-fbaead894758
 ```
 
-Resolve dependencies:
+If NVML discovers a GPU but the corresponding CDI device doesn't exist, the GPU isn't advertised by the plugin.
+
+---
+
+# Repository Layout
+
+The repository is organized as:
+
+```text
+k8s-gpu-device-plugin/
+├── .github/
+│   └── workflows/
+│       └── go.yaml
+│
+├── deploy/
+│   └── daemonset.yaml
+│
+├── docs/
+│   ├── LICENSE
+│   ├── README.md
+│   └── docs.md
+│
+├── src/
+│   ├── cdi.go
+│   ├── go.mod
+│   ├── go.sum
+│   ├── gpu.go
+│   ├── main.go
+│   ├── manager.go
+│   └── plugin.go
+│
+├── Dockerfile
+└── .gitignore
+```
+
+## `src/main.go`
+
+Application entry point and configuration.
+
+Responsibilities:
+
+```text
+environment configuration
+NVML initialization
+NVML shutdown
+signal handling
+dependency wiring
+Manager startup
+```
+
+## `src/gpu.go`
+
+GPU and NVML layer.
+
+Responsibilities:
+
+```text
+GPU representation
+NVML discovery
+model normalization
+resource naming
+XID monitoring
+periodic health probes
+health recovery
+```
+
+## `src/cdi.go`
+
+CDI abstraction.
+
+Validates that a CDI device such as:
+
+```text
+nvidia.com/gpu=<UUID>
+```
+
+exists before the physical GPU is advertised or allocated.
+
+## `src/plugin.go`
+
+Kubernetes Device Plugin implementation.
+
+Responsibilities:
+
+```text
+gRPC server
+kubelet registration
+GetDevicePluginOptions
+ListAndWatch
+Allocate
+health state
+plugin socket lifecycle
+```
+
+## `src/manager.go`
+
+Top-level node lifecycle coordinator.
+
+Responsibilities:
+
+```text
+GPU discovery orchestration
+CDI validation
+resource grouping
+plugin creation
+startup rollback
+UUID ownership
+health update routing
+kubelet restart handling
+plugin socket recovery
+shutdown
+```
+
+## `deploy/daemonset.yaml`
+
+Kubernetes DaemonSet used to run one plugin Pod on each targeted node.
+
+## `.github/workflows/go.yaml`
+
+CI pipeline for:
+
+```text
+dependency verification
+go vet
+go test
+Go binary build
+container image build
+GHCR publishing
+```
+
+---
+
+# Configuration
+
+Configuration is provided through environment variables.
+
+| Environment Variable | Default | Description |
+|---|---:|---|
+| `GPU_RESOURCE_DOMAIN` | `gpu.local` | Domain used for Kubernetes extended resources |
+| `GPU_PLUGIN_PATH` | `/var/lib/kubelet/device-plugins` | kubelet Device Plugin directory |
+| `GPU_HEALTH_PROBE_INTERVAL` | `5s` | Interval between NVML health probes |
+| `GPU_HEALTH_RECOVERY_DELAY` | `30s` | Minimum time before recovery can begin |
+| `GPU_HEALTH_RECOVERY_SUCCESSES` | `3` | Consecutive successful probes required for recovery |
+
+Example:
 
 ```bash
-go mod tidy
+GPU_RESOURCE_DOMAIN=gpu.example.com \
+GPU_HEALTH_PROBE_INTERVAL=5s \
+GPU_HEALTH_RECOVERY_DELAY=30s \
+GPU_HEALTH_RECOVERY_SUCCESSES=3 \
+./k8s-gpu-device-plugin
+```
+
+## Resource Domain
+
+For local development:
+
+```text
+gpu.local
+```
+
+is sufficient.
+
+For a real shared cluster, use a domain controlled by the organization:
+
+```text
+gpu.example.com
+```
+
+This produces resources such as:
+
+```text
+gpu.example.com/rtx-4090
+gpu.example.com/rtx-3060-ti
+gpu.example.com/a100-sxm4-40gb
+```
+
+---
+
+# Building From Source
+
+The Go module is located under:
+
+```text
+src/
+```
+
+Clone the repository and enter the source directory:
+
+```bash
+git clone https://github.com/maxagateff/k8s-gpu-device-plugin.git
+cd k8s-gpu-device-plugin/src
+```
+
+For the current development branch:
+
+```bash
+git checkout develop
+```
+
+Verify dependencies:
+
+```bash
+go mod verify
 ```
 
 Run static checks:
@@ -395,94 +648,224 @@ Build:
 go build -o k8s-gpu-device-plugin .
 ```
 
-Verify the binary:
-
-```bash
-ls -lh k8s-gpu-device-plugin
-file k8s-gpu-device-plugin
-```
-
 A normal local validation cycle is:
 
 ```bash
 go fmt ./...
 go mod tidy
+go mod verify
 go vet ./...
 go test ./...
 go build -o k8s-gpu-device-plugin .
 ```
 
+Because the project uses NVIDIA's Go NVML bindings, the container build enables CGO.
+
 ---
 
-# Configuration
+# Container Image
 
-The plugin is configured through env vars.
+The repository contains a multi-stage Docker build.
 
-| Env Var | Default | Description |
-|---|---|---|
-| `GPU_RESOURCE_DOMAIN` | `gpu.local` | Domain used for K8s extended resources |
-| `GPU_PLUGIN_PATH` | `/var/lib/kubelet/device-plugins` | kubelet Device Plugin directory |
-| `GPU_HEALTH_PROBE_INTERVAL` | `5s` | Interval between NVML health probes |
-| `GPU_HEALTH_RECOVERY_DELAY` | `30s` | Minimum delay before a GPU can recover |
-| `GPU_HEALTH_RECOVERY_SUCCESSES` | `3` | Successful probes required before returning to `Healthy` |
-
-Example:
-
-```bash
-GPU_RESOURCE_DOMAIN=example.com \
-GPU_HEALTH_PROBE_INTERVAL=5s \
-GPU_HEALTH_RECOVERY_DELAY=30s \
-GPU_HEALTH_RECOVERY_SUCCESSES=3 \
-./k8s-gpu-device-plugin
-```
-
-## Resource domain
-
-The resource domain should be changed for real deployments.
-
-For example:
-
-```bash
-GPU_RESOURCE_DOMAIN=gpu.example.com
-```
-
-Resources will then look like:
+Conceptually:
 
 ```text
-gpu.example.com/rtx-4090
-gpu.example.com/rtx-3060-ti
-gpu.example.com/a100-sxm4-40gb
+golang:1.24
+    |
+    | CGO_ENABLED=1
+    | go build
+    v
+k8s-gpu-device-plugin binary
+    |
+    v
+ubuntu:24.04 runtime image
 ```
 
-Use a domain controlled by your org when deploying this in a shared or production cluster.
+Build locally from the repository root:
+
+```bash
+docker build -t k8s-gpu-device-plugin:dev .
+```
+
+The resulting container starts:
+
+```text
+/usr/local/bin/k8s-gpu-device-plugin
+```
+
+The image intentionally doesn't contain an NVIDIA kernel driver.
+
+The plugin needs access to the NVIDIA driver/NVML environment of the GPU node at runtime.
 
 ---
 
-# Running the Plugin
+# CI and GHCR
 
-For a direct node-level test:
+GitHub Actions is configured in:
 
-```bash
-sudo GPU_RESOURCE_DOMAIN=gpu.local ./k8s-gpu-device-plugin
+```text
+.github/workflows/go.yaml
 ```
 
-The process needs access to:
+Pushes to the configured development/release branches run the CI pipeline.
+
+The pipeline performs:
+
+```text
+checkout
+   |
+   v
+go mod verify
+   |
+   v
+go vet ./...
+   |
+   v
+go test ./...
+   |
+   v
+go build
+   |
+   v
+docker build
+   |
+   v
+GHCR push
+```
+
+The container image is published to:
+
+```text
+ghcr.io/maxagateff/k8s-gpu-device-plugin
+```
+
+The workflow publishes:
+
+```text
+ghcr.io/maxagateff/k8s-gpu-device-plugin:latest
+```
+
+and an immutable image tag based on the Git commit SHA.
+
+This gives two useful references:
+
+```text
+latest
+```
+
+for development/testing, and:
+
+```text
+<commit-sha>
+```
+
+for reproducible deployments.
+
+For production deployments, prefer an immutable version or commit tag rather than relying permanently on `latest`.
+
+---
+
+# Kubernetes Deployment
+
+The intended deployment model is a Kubernetes `DaemonSet`.
+
+Why a DaemonSet?
+
+A Device Plugin isn't a central cluster service. It has to run on the node whose hardware it manages.
+
+```text
+Kubernetes Cluster
+
+GPU Node A
+├── RTX 3060 Ti
+├── kubelet
+└── k8s-gpu-device-plugin Pod
+
+GPU Node B
+├── A100
+├── kubelet
+└── k8s-gpu-device-plugin Pod
+```
+
+Each instance:
+
+1. discovers local GPUs through NVML
+2. validates local CDI devices
+3. connects to the local kubelet
+4. registers local model-specific resources
+
+The control plane then sees the resources reported by every node.
+
+Deploy:
+
+```bash
+kubectl apply -f deploy/daemonset.yaml
+```
+
+Check the DaemonSet:
+
+```bash
+kubectl get daemonset -A | grep k8s-gpu-device-plugin
+```
+
+Check plugin Pods:
+
+```bash
+kubectl get pods -A -l app=k8s-gpu-device-plugin -o wide
+```
+
+Read logs:
+
+```bash
+kubectl logs -n <namespace> -l app=k8s-gpu-device-plugin
+```
+
+Remove the deployment:
+
+```bash
+kubectl delete -f deploy/daemonset.yaml
+```
+
+---
+
+## Required Host Access
+
+The plugin needs access to the node's Device Plugin directory:
 
 ```text
 /var/lib/kubelet/device-plugins
 ```
 
-Typical startup logs should look similar to:
+The DaemonSet mounts this path into the container using `hostPath`.
+
+This makes the node's:
 
 ```text
-k8s-gpu-device-plugin starting domain=gpu.local pluginPath=/var/lib/kubelet/device-plugins
-
-discovered GPU model="NVIDIA GeForce RTX 3060 Ti" uuid=GPU-... resource=gpu.local/rtx-3060-ti cdi=nvidia.com/gpu=GPU-...
-
-registered resource=gpu.local/rtx-3060-ti socket=/var/lib/kubelet/device-plugins/k8s-gpu-rtx-3060-ti.sock devices=1
+/var/lib/kubelet/device-plugins/kubelet.sock
 ```
 
-The exact UUIDs and resource names depend on the GPUs installed on the node.
+available to the plugin process inside the container.
+
+The deployment also exposes the host CDI directories:
+
+```text
+/etc/cdi
+/var/run/cdi
+```
+
+so the plugin can validate the CDI devices generated for the node.
+
+The current deployment also makes the node's NVML library available to the container:
+
+```text
+/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+```
+
+Without NVML access, startup fails with:
+
+```text
+FATAL: initialize NVML: ERROR_LIBRARY_NOT_FOUND
+```
 
 ---
 
@@ -490,26 +873,20 @@ The exact UUIDs and resource names depend on the GPUs installed on the node.
 
 GPU discovery happens through NVML.
 
-The plugin calls NVML to enumerate physical GPU devices and obtains:
-
-```text
-index -> NVML device -> UUID -> model
-```
-
 Conceptually:
 
 ```text
-DeviceGetCount()
-      |
-      v
-DeviceGetHandleByIndex(i)
-      |
-      +----> GetUUID()
-      |
-      +----> GetName()
+nvml.DeviceGetCount()
+        |
+        v
+nvml.DeviceGetHandleByIndex(i)
+        |
+        +------> GetUUID()
+        |
+        +------> GetName()
 ```
 
-A discovered GPU is represented internally as:
+A discovered GPU is represented internally by:
 
 ```text
 GPU
@@ -523,74 +900,78 @@ GPU
 Example:
 
 ```text
-UUID:
-GPU-c0a1bd7d-....
-
 Model:
 NVIDIA GeForce RTX 3060 Ti
 
-ResourceName:
+UUID:
+GPU-c0a1bd7d-9471-1ea3-0e5d-fbaead894758
+
+Resource:
 gpu.local/rtx-3060-ti
 
-CDIName:
-nvidia.com/gpu=GPU-c0a1bd7d-....
+CDI:
+nvidia.com/gpu=GPU-c0a1bd7d-9471-1ea3-0e5d-fbaead894758
 
 Health:
 Healthy
 ```
 
-Duplicate UUIDs are rejected during discovery.
+Duplicate UUIDs discovered through NVML cause startup to fail rather than allowing ambiguous physical device identity.
 
 ---
 
 # Resource Naming
 
-GPU model names are normalized into valid resource suffixes.
+GPU model names are normalized automatically.
 
 For example:
 
 ```text
-NVIDIA GeForce RTX 4090
+NVIDIA GeForce RTX 3060 Ti
 ```
 
 becomes:
 
 ```text
-rtx-4090
+rtx-3060-ti
 ```
 
-With:
-
-```bash
-GPU_RESOURCE_DOMAIN=example.com
-```
-
-the final K8s resource is:
+and with:
 
 ```text
-example.com/rtx-4090
+GPU_RESOURCE_DOMAIN=gpu.local
+```
+
+the final resource is:
+
+```text
+gpu.local/rtx-3060-ti
 ```
 
 Additional examples:
 
 ```text
-NVIDIA GeForce RTX 3060 Ti
--> example.com/rtx-3060-ti
-
 NVIDIA GeForce GTX 1660 SUPER
--> example.com/gtx-1660-super
+-> gpu.local/gtx-1660-super
+
+NVIDIA GeForce RTX 4090
+-> gpu.local/rtx-4090
 
 NVIDIA A100-SXM4-40GB
--> example.com/a100-sxm4-40gb
+-> gpu.local/a100-sxm4-40gb
 ```
 
-The NVIDIA/GeForce prefixes aren't required in the final resource name because the resource domain already identifies the resource namespace.
+The `NVIDIA` and `NVIDIA GeForce` prefixes are removed during canonicalization.
+
+Other separators are normalized into `-`.
+
+Resource suffixes are validated before registration.
 
 ---
 
-# Kubernetes Registration
+# Device Plugin Registration
 
-Each GPU model gets its own Device Plugin gRPC endpoint.
+Each model-specific resource receives its own Device Plugin Unix socket.
 
 Example:
 
@@ -598,13 +979,13 @@ Example:
 gpu.local/rtx-3060-ti
 ```
 
-uses a socket similar to:
+uses:
 
 ```text
 /var/lib/kubelet/device-plugins/k8s-gpu-rtx-3060-ti.sock
 ```
 
-Another resource:
+while:
 
 ```text
 gpu.local/gtx-1660-super
@@ -616,39 +997,38 @@ uses:
 /var/lib/kubelet/device-plugins/k8s-gpu-gtx-1660-super.sock
 ```
 
-The plugin registers each endpoint with kubelet using the Kubernetes Device Plugin API.
+Each endpoint is registered independently with kubelet.
 
-After registration, check the node:
-
-```bash
-kubectl describe node <node-name>
-```
-
-You should see resources under `Capacity` and `Allocatable`.
-
-Example:
+Successful startup logs look similar to:
 
 ```text
-Capacity:
-  gpu.local/gtx-1660-super: 1
-  gpu.local/rtx-3060-ti:    2
+k8s-gpu-device-plugin starting domain=gpu.local pluginPath=/var/lib/kubelet/device-plugins
 
-Allocatable:
-  gpu.local/gtx-1660-super: 1
-  gpu.local/rtx-3060-ti:    2
+discovered GPU model="NVIDIA GeForce RTX 3060 Ti" uuid=GPU-... resource=gpu.local/rtx-3060-ti cdi=nvidia.com/gpu=GPU-...
+
+registered resource=gpu.local/rtx-3060-ti socket=/var/lib/kubelet/device-plugins/k8s-gpu-rtx-3060-ti.sock devices=1
 ```
 
-You can also inspect the node directly:
+After registration:
 
 ```bash
 kubectl get node <node-name> -o json | jq '.status.capacity, .status.allocatable'
 ```
 
+should contain entries such as:
+
+```json
+{
+  "gpu.local/gtx-1660-super": "1",
+  "gpu.local/rtx-3060-ti": "1"
+}
+```
+
 ---
 
-# Using GPUs in Workloads
+# Requesting a GPU
 
-A workload requests a specific GPU model using standard K8s resource limits.
+A workload requests a model using a normal Kubernetes resource limit.
 
 Example:
 
@@ -657,60 +1037,115 @@ apiVersion: v1
 kind: Pod
 
 metadata:
-  name: gpu-test
+  name: test-rtx
+  namespace: test-code
 
 spec:
   restartPolicy: Never
 
   containers:
-    - name: cuda
+    - name: test
       image: nvidia/cuda:12.1.0-base-ubuntu22.04
-
-      command:
-        - bash
-        - -c
-        - |
-          nvidia-smi -L
-          sleep 10
+      command: ["bash", "-c", "nvidia-smi -L"]
 
       resources:
         limits:
           gpu.local/rtx-3060-ti: 1
 ```
 
-Apply it:
+Apply:
 
 ```bash
-kubectl apply -f pod.yaml
+kubectl apply -f test-gpu-test-pod.yaml
 ```
 
-Check the Pod:
+Check:
 
 ```bash
-kubectl get pod gpu-test -o wide
+kubectl get pod -n test-code test-rtx -o wide
 ```
 
-Read the logs:
+Read the result:
 
 ```bash
-kubectl logs gpu-test
+kubectl logs -n test-code test-rtx
 ```
 
-Expected output:
+A successful allocation looks like:
 
 ```text
-GPU 0: NVIDIA GeForce RTX 3060 Ti (...)
+GPU 0: NVIDIA GeForce RTX 3060 Ti (UUID: GPU-...)
 ```
 
-The container should only receive the GPU selected by kubelet/CDI for that allocation.
+The workload receives the physical GPU selected by kubelet and returned through CDI by the plugin.
+
+---
+
+# Allocation Flow
+
+The complete scheduling and allocation path is:
+
+```text
+Pod
+ |
+ | requests:
+ | gpu.local/rtx-3060-ti: 1
+ |
+ v
+Kubernetes Scheduler
+ |
+ | selects node with allocatable resource
+ |
+ v
+kubelet
+ |
+ | selects Device ID / GPU UUID
+ |
+ v
+k8s-gpu-device-plugin
+ |
+ | Allocate()
+ |
+ +------> UUID exists?
+ |
+ +------> UUID belongs to this resource?
+ |
+ +------> duplicate request?
+ |
+ +------> GPU Healthy?
+ |
+ +------> CDI device exists?
+ |
+ v
+ContainerAllocateResponse
+ |
+ | CDI device:
+ | nvidia.com/gpu=<GPU-UUID>
+ |
+ v
+Container Runtime
+ |
+ v
+CDI
+ |
+ v
+Physical NVIDIA GPU
+ |
+ v
+Workload Container
+```
+
+The plugin doesn't blindly trust the device IDs in an allocation request.
+
+Every requested UUID is validated before a CDI device is returned.
 
 ---
 
 # Multi-GPU Allocation
 
-Multiple GPUs of the same model are exposed under one resource.
+Multiple physical GPUs of the same model are grouped under one resource.
 
-Example node:
+Example:
 
 ```text
 GPU-A -> RTX 4090
@@ -719,13 +1154,13 @@ GPU-C -> RTX 4090
 GPU-D -> RTX 4090
 ```
 
-Kubernetes sees:
+The node advertises:
 
 ```text
 gpu.local/rtx-4090: 4
 ```
 
-A workload can request two:
+A workload can request:
 
 ```yaml
 resources:
@@ -733,92 +1168,29 @@ resources:
     gpu.local/rtx-4090: 2
 ```
 
-kubelet selects two device IDs and sends them to `Allocate()`.
-
-Conceptually:
+kubelet can then select two device IDs:
 
 ```text
-AllocateRequest
-    |
-    +---- GPU-UUID-A
-    |
-    +---- GPU-UUID-C
+GPU-A
+GPU-C
 ```
 
 The plugin validates both and returns:
 
 ```text
-nvidia.com/gpu=GPU-UUID-A
-nvidia.com/gpu=GPU-UUID-C
+nvidia.com/gpu=GPU-A
+nvidia.com/gpu=GPU-C
 ```
 
-through CDI.
-
----
-
-# Allocation Flow
-
-The full allocation path is:
-
-```text
-Pod
- |
- | requests:
- | gpu.local/rtx-4090: 1
- |
- v
-K8s Scheduler
- |
- v
-kubelet
- |
- | selects physical device UUID
- |
- v
-Device Plugin
- |
- | Allocate()
- |
- +----> UUID exists?
- |
- +----> UUID belongs to this resource?
- |
- +----> GPU Healthy?
- |
- +----> duplicate request?
- |
- +----> CDI device exists?
- |
- v
-ContainerAllocateResponse
- |
- | CdiDevices:
- | nvidia.com/gpu=<UUID>
- |
- v
-Container Runtime
- |
- v
-NVIDIA CDI
- |
- v
-Container
- |
- v
-Physical GPU
-```
-
-`Allocate()` doesn't blindly trust the IDs sent in the request.
-
-Each requested UUID is validated before the plugin returns a CDI device.
+through the Device Plugin API's CDI response.
 
 ---
 
 # CDI Integration
 
-The plugin uses the Container Device Interface (CDI) to expose GPUs to containers.
+The plugin uses the Container Device Interface instead of manually constructing NVIDIA device mounts.
 
-It does **not** manually inject:
+It doesn't manually inject:
 
 ```text
 /dev/nvidia0
@@ -826,197 +1198,196 @@ It does **not** manually inject:
 /dev/nvidia-uvm
 ```
 
-and it doesn't manually construct NVIDIA-specific env vars or mounts.
+and doesn't manually construct NVIDIA-specific environment variables.
 
-Instead, it returns a CDI device:
+Instead, allocation returns:
 
 ```text
 nvidia.com/gpu=<GPU-UUID>
 ```
 
-Example:
+The container runtime and NVIDIA-generated CDI specification perform the actual device injection.
+
+This keeps the plugin focused on:
 
 ```text
-nvidia.com/gpu=GPU-c0a1bd7d-9471-1ea3-0e5d-fbaead894758
+discovery
+resource identity
+device selection validation
+health
+kubelet integration
 ```
 
-The container runtime and NVIDIA CDI spec handle the actual device injection.
+while CDI handles container-level device injection.
 
-Before a GPU is advertised/allocated, the plugin validates that the corresponding CDI device exists.
+Before advertising a GPU, the manager checks that its CDI device exists.
 
-Check available CDI devices with:
-
-```bash
-nvidia-ctk cdi list
-```
-
-If NVML sees a GPU but CDI doesn't contain the matching UUID, the device won't be considered usable by the plugin.
+The CDI cache is refreshed during lookup.
 
 ---
 
 # Health Monitoring
 
-GPU health is tracked through NVML.
+GPU health is monitored through NVML.
 
-Kubernetes Device Plugin health values are:
+Kubernetes Device Plugin health states are:
 
 ```text
 Healthy
 Unhealthy
 ```
 
-The plugin uses two mechanisms:
+The plugin uses:
 
 1. NVML XID critical error events
 2. periodic NVML probes
 
-## XID events
+---
 
-If NVML reports a critical XID event for a GPU, the plugin marks it:
+## XID Monitoring
+
+The health monitor registers for:
+
+```text
+nvml.EventTypeXidCriticalError
+```
+
+When a critical XID event is received:
+
+```text
+NVML XID event
+      |
+      v
+HealthUpdate
+      |
+      v
+devicePlugin.setHealth()
+      |
+      v
+ListAndWatch update
+      |
+      v
+kubelet
+```
+
+The affected GPU is marked:
 
 ```text
 Unhealthy
 ```
 
-The state change is propagated through `ListAndWatch`.
+and kubelet receives the new state through `ListAndWatch`.
 
-Conceptually:
+---
+
+## Periodic Probes
+
+The plugin periodically resolves each known GPU through NVML.
+
+The default probe interval is:
 
 ```text
-NVML XID
-   |
-   v
-HealthUpdate
-   |
-   v
-devicePlugin.setHealth()
-   |
-   v
-updates channel
-   |
-   v
-ListAndWatch
-   |
-   v
-kubelet
+5s
 ```
 
-kubelet can then stop considering the device available for new allocations.
+A failed probe marks the GPU unhealthy.
+
+---
 
 ## Recovery
 
-An unhealthy GPU isn't immediately returned to service after one successful probe.
+An unhealthy GPU isn't immediately restored after one successful probe.
 
-Recovery uses:
-
-```text
-GPU_HEALTH_RECOVERY_DELAY
-```
-
-and:
-
-```text
-GPU_HEALTH_RECOVERY_SUCCESSES
-```
-
-With the defaults:
+The defaults are:
 
 ```text
 GPU_HEALTH_RECOVERY_DELAY=30s
 GPU_HEALTH_RECOVERY_SUCCESSES=3
 ```
 
-the GPU needs to wait at least 30 seconds and pass three successful probes before being marked `Healthy` again.
+After the recovery delay, the GPU must pass the configured number of successful probes before being marked:
 
-This helps avoid rapid health-state flapping.
+```text
+Healthy
+```
+
+again.
+
+This reduces health-state flapping.
 
 ---
 
 # kubelet Restart Handling
 
-kubelet exposes its Device Plugin registration socket at:
+The kubelet Device Plugin registration socket is:
 
 ```text
 /var/lib/kubelet/device-plugins/kubelet.sock
 ```
 
-When kubelet restarts, that socket may be removed and recreated.
+When kubelet restarts, this socket can be recreated.
 
-The plugin watches:
+The manager watches the Device Plugin directory using `fsnotify`.
 
-```text
-/var/lib/kubelet/device-plugins
-```
-
-using filesystem notifications.
-
-When a new `kubelet.sock` is detected, the manager re-registers all active GPU resources.
-
-Flow:
+When creation of the kubelet socket is detected:
 
 ```text
 kubelet restart
       |
       v
-old kubelet.sock removed
+kubelet.sock recreated
       |
       v
-new kubelet.sock created
+fsnotify
       |
       v
-fsnotify event
+Manager.reregisterAll()
       |
       v
-Manager
-      |
-      v
-reregisterAll()
-      |
-      v
-all GPU resources registered again
+all active resources registered again
 ```
 
-A normal kubelet restart therefore shouldn't require manually restarting the GPU plugin.
+This is designed to allow kubelet restarts without manually restarting the GPU plugin.
 
 ---
 
 # Plugin Socket Recovery
 
-Each resource owns a Unix socket.
+Each resource has its own Unix socket.
 
-Example:
+For example:
 
 ```text
-/var/lib/kubelet/device-plugins/k8s-gpu-rtx-4090.sock
+/var/lib/kubelet/device-plugins/k8s-gpu-rtx-3060-ti.sock
 ```
 
-The manager watches the Device Plugin directory for socket removal or rename events.
+The manager watches for removal or rename events affecting these sockets.
 
-If a plugin socket disappears, the manager attempts to:
+If one disappears:
 
 ```text
+plugin socket removed
+      |
+      v
 stop old endpoint
       |
       v
-remove stale state
+recreate Unix socket
       |
       v
-create Unix socket
+restart gRPC server
       |
       v
-start gRPC server
-      |
-      v
-register with kubelet
+register resource with kubelet
 ```
 
-This prevents a deleted endpoint from silently leaving the resource unavailable.
+This prevents accidental socket deletion from permanently removing the resource endpoint while the process is still running.
 
 ---
 
 # Duplicate GPU Protection
 
-A physical GPU is identified by its NVML UUID.
+Physical identity is based on the NVIDIA GPU UUID.
 
 Example:
 
@@ -1024,7 +1395,7 @@ Example:
 GPU-c0a1bd7d-9471-1ea3-0e5d-fbaead894758
 ```
 
-The same UUID must not be advertised under multiple resources.
+A UUID must belong to exactly one model-specific resource.
 
 Invalid state:
 
@@ -1036,9 +1407,9 @@ gpu.local/some-other-resource
 └── GPU-A
 ```
 
-The manager checks this during startup.
+Duplicate protection exists during discovery and resource/plugin construction.
 
-If the same UUID would be mapped to multiple plugins, startup fails instead of double-advertising the physical device.
+The plugin fails rather than knowingly advertising one physical GPU through multiple internal resource groups.
 
 ---
 
@@ -1051,148 +1422,55 @@ SIGINT
 SIGTERM
 ```
 
-This matters when running under:
-
-- systemd
-- Kubernetes
-- containerd
-- Docker
-- a process supervisor
-
-On shutdown:
+Shutdown flow:
 
 ```text
-signal
-  |
-  v
+SIGTERM / SIGINT
+       |
+       v
 context canceled
-  |
-  v
-Manager.Run() exits
-  |
-  v
-plugins stop
-  |
-  +----> gRPC servers stop
-  |
-  +----> listeners close
-  |
-  +----> plugin sockets removed
-  |
-  v
+       |
+       v
+Manager exits
+       |
+       v
+Device Plugins stop
+       |
+       +------> gRPC servers stop
+       |
+       +------> listeners close
+       |
+       +------> sockets removed
+       |
+       v
 NVML shutdown
 ```
 
-This avoids leaving stale Device Plugin sockets behind after a normal shutdown.
-
----
-
-# Project Structure
-
-```text
-k8s-gpu-device-plugin/
-├── cdi.go
-├── go.mod
-├── go.sum
-├── gpu.go
-├── LICENSE
-├── main.go
-├── manager.go
-├── plugin.go
-└── docs.md
-```
-
-## `main.go`
-
-Application entry point and config.
-
-Responsible for:
-
-```text
-Config
-env parsing
-NVML init/shutdown
-signal handling
-dependency wiring
-Manager startup
-```
-
-## `gpu.go`
-
-GPU/NVML layer.
-
-Responsible for:
-
-```text
-GPU model
-GPU discovery
-model normalization
-resource naming
-NVML health monitoring
-health recovery
-```
-
-## `cdi.go`
-
-CDI abstraction.
-
-Responsible for validating:
-
-```text
-nvidia.com/gpu=<UUID>
-```
-
-against the host CDI cache.
-
-## `plugin.go`
-
-Kubernetes Device Plugin implementation.
-
-Responsible for:
-
-```text
-gRPC server
-kubelet registration
-ListAndWatch
-Allocate
-health state
-plugin socket lifecycle
-```
-
-## `manager.go`
-
-Top-level lifecycle coordinator.
-
-Responsible for:
-
-```text
-GPU grouping
-plugin creation
-startup rollback
-UUID ownership
-health routing
-kubelet restart handling
-plugin socket recovery
-shutdown
-```
+This is important when the plugin runs as a Kubernetes Pod because Pod termination normally delivers `SIGTERM`.
 
 ---
 
 # Operational Checks
 
-## GPU visibility
+## Physical GPUs
 
 ```bash
 nvidia-smi -L
 ```
 
-## NVML/driver status
+## Driver
 
 ```bash
 nvidia-smi
 ```
 
-## CDI devices
+## NVML library
+
+```bash
+ldconfig -p | grep libnvidia-ml
+```
+
+## CDI
 
 ```bash
 nvidia-ctk cdi list
@@ -1204,7 +1482,7 @@ nvidia-ctk cdi list
 ls -lah /var/lib/kubelet/device-plugins/
 ```
 
-Example:
+Expected sockets can include:
 
 ```text
 kubelet.sock
@@ -1212,22 +1490,28 @@ k8s-gpu-rtx-3060-ti.sock
 k8s-gpu-gtx-1660-super.sock
 ```
 
-## K8s node resources
+## DaemonSet
 
 ```bash
-kubectl describe node <node-name>
+kubectl get daemonset -A | grep k8s-gpu-device-plugin
 ```
 
-Or:
+## Plugin Pods
 
 ```bash
-kubectl get node <node-name> -o json | jq '.status.capacity'
+kubectl get pods -A -l app=k8s-gpu-device-plugin -o wide
 ```
 
-And:
+## Plugin logs
 
 ```bash
-kubectl get node <node-name> -o json | jq '.status.allocatable'
+kubectl logs -n <namespace> -l app=k8s-gpu-device-plugin
+```
+
+## Kubernetes GPU resources
+
+```bash
+kubectl get node <node-name> -o json | jq '.status.capacity, .status.allocatable'
 ```
 
 ## kubelet logs
@@ -1236,63 +1520,81 @@ kubectl get node <node-name> -o json | jq '.status.allocatable'
 journalctl -u kubelet -f
 ```
 
-## Plugin process
-
-```bash
-ps aux | grep k8s-gpu-device-plugin
-```
-
 ---
 
 # Troubleshooting
 
+## `initialize NVML: ERROR_LIBRARY_NOT_FOUND`
+
+The plugin container can't access:
+
+```text
+libnvidia-ml.so.1
+```
+
+Verify the library on the host:
+
+```bash
+ldconfig -p | grep libnvidia-ml
+```
+
+The container deployment must make the host NVIDIA/NVML runtime available to the plugin.
+
+The current DaemonSet expects the NVML library at:
+
+```text
+/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+```
+
+This path is host/distribution specific and may need to be changed on other systems.
+
+---
+
 ## `no supported NVIDIA GPUs discovered`
 
-Check whether the host driver sees the GPU:
+Verify:
 
 ```bash
 nvidia-smi -L
 ```
 
-If `nvidia-smi` can't see the GPU, the plugin won't be able to discover it through NVML either.
+If the NVIDIA driver can't see the device, NVML discovery won't see it either.
 
 ---
 
 ## `no GPUs have usable CDI devices`
 
-NVML discovered one or more GPUs, but the matching CDI devices weren't available.
+NVML discovered GPUs, but none had a matching CDI device.
 
-Check:
-
-```bash
-nvidia-ctk cdi list
-```
-
-The GPU UUID discovered through:
+Compare:
 
 ```bash
 nvidia-smi -L
 ```
 
-should have a corresponding entry:
+with:
+
+```bash
+nvidia-ctk cdi list
+```
+
+Each advertised physical GPU needs:
 
 ```text
-nvidia.com/gpu=<UUID>
+nvidia.com/gpu=<GPU-UUID>
 ```
 
 ---
 
 ## `CDI device "nvidia.com/gpu=..." not found`
 
-The host CDI config doesn't contain the requested physical GPU.
-
-Check:
+Refresh/check the host CDI setup:
 
 ```bash
 nvidia-ctk cdi list
 ```
 
-Also verify the NVIDIA Container Toolkit installation/config.
+Verify that the exact UUID discovered by NVML appears in the CDI output.
 
 ---
 
@@ -1318,23 +1620,21 @@ journalctl -u kubelet -n 100
 
 ---
 
-## Resource doesn't show up on the node
+## Resource Doesn't Appear on the Node
 
-First verify the plugin process is running.
+Check plugin logs first:
 
-Then check its socket:
+```bash
+kubectl logs -n <namespace> -l app=k8s-gpu-device-plugin
+```
+
+Check sockets:
 
 ```bash
 ls -lah /var/lib/kubelet/device-plugins/
 ```
 
-Check kubelet logs:
-
-```bash
-journalctl -u kubelet -f
-```
-
-Then inspect node resources:
+Then inspect:
 
 ```bash
 kubectl get node <node-name> -o json | jq '.status.capacity, .status.allocatable'
@@ -1342,80 +1642,118 @@ kubectl get node <node-name> -o json | jq '.status.capacity, .status.allocatable
 
 ---
 
-## Pod stays `Pending`
+## Pod Stays `Pending`
 
-Inspect the Pod:
+Inspect:
 
 ```bash
-kubectl describe pod <pod-name>
+kubectl describe pod -n <namespace> <pod-name>
 ```
 
-Typical causes include:
+Common causes:
 
-- requested GPU model isn't available on any schedulable node
-- requested GPU count exceeds `Allocatable`
-- node selector/affinity prevents placement
-- taints/tolerations prevent placement
-- GPU is currently allocated
-- GPU was marked `Unhealthy`
-
-Check:
-
-```bash
-kubectl get nodes
-kubectl describe node <node-name>
-kubectl describe pod <pod-name>
+```text
+requested GPU model isn't available
+requested count exceeds Allocatable
+GPU is already allocated
+GPU is Unhealthy
+node selector/affinity prevents scheduling
+taints/tolerations prevent scheduling
 ```
 
 ---
 
-## Pod starts but doesn't see the GPU
+## Pod Starts but Doesn't See the GPU
 
-Check CDI first:
+Check the requested resource:
+
+```yaml
+resources:
+  limits:
+    gpu.local/rtx-3060-ti: 1
+```
+
+Check CDI:
 
 ```bash
 nvidia-ctk cdi list
 ```
 
-Then test the runtime outside the workload if necessary.
-
-Inside the Pod:
+Then inside the workload:
 
 ```bash
 nvidia-smi -L
 ```
 
-The selected GPU should be visible.
+The container should see the selected physical GPU.
 
 ---
 
 # Known Limitations
 
-The current implementation has several intentional limitations.
+## NVIDIA Only
 
-## NVIDIA only
+The current backend depends on NVML.
 
-GPU discovery and health monitoring are based on NVML.
+AMD and Intel GPUs aren't supported.
 
-AMD and Intel GPUs aren't supported by the current backend.
+The discovery abstraction allows additional backends to be introduced later, but they aren't implemented today.
 
-The internal interfaces make it possible to add other discovery backends later, but they aren't implemented today.
+---
 
-## Startup-time discovery
+## Startup-Time Discovery
 
-Physical GPU discovery currently happens during plugin startup.
+GPU topology is discovered during startup.
 
-Runtime GPU hot-add/hot-remove doesn't trigger a full topology rediscovery.
+Physical GPU hot-add/hot-remove doesn't currently trigger full rediscovery and resource regrouping.
 
-If the physical GPU topology changes, restart the plugin.
+Restart the plugin after changing physical GPU topology.
 
-## XID recovery policy
+---
 
-The current health recovery logic uses successful NVML probes after a recovery delay.
+## Host-Specific NVML Mount
 
-Not every NVIDIA XID should necessarily be treated as automatically recoverable in a strict production environment.
+The current DaemonSet exposes:
 
-For production clusters with aggressive fault isolation, XID errors should be classified and some classes should remain `Unhealthy` until:
+```text
+/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+```
+
+from the host.
+
+That path isn't portable across every Linux distribution, driver installation method, or CPU architecture.
+
+A more portable NVIDIA runtime integration should replace the hardcoded host library path for broader distribution.
+
+---
+
+## amd64 Container Build
+
+The current Docker build explicitly targets:
+
+```text
+GOARCH=amd64
+```
+
+so the published image is currently intended for x86-64 GPU nodes.
+
+Multi-architecture image publishing isn't implemented yet.
+
+---
+
+## Startup CDI Validation
+
+A GPU without a usable CDI device is skipped during startup.
+
+Dynamic CDI topology changes don't currently cause a full GPU/resource rediscovery.
+
+---
+
+## XID Recovery Policy
+
+The current implementation can return an unhealthy GPU to service after the configured delay and successful probes.
+
+Some XID classes may require stricter handling in production, including:
 
 ```text
 GPU reset
@@ -1423,229 +1761,270 @@ node reboot
 operator intervention
 ```
 
-## No topology-aware allocation
-
-The plugin currently doesn't implement topology-aware preferred allocation based on:
-
-- NUMA
-- PCIe topology
-- NVLink
-- NVSwitch
-
-`GetPreferredAllocationAvailable` is reported as `false`.
-
-## No PreStart requirement
-
-The plugin doesn't require a `PreStartContainer` operation.
-
-`PreStartRequired` is reported as `false`.
+A future implementation can classify XIDs instead of treating all critical XID events through the same recovery policy.
 
 ---
 
-# Security Notes
+## No Topology-Aware Preferred Allocation
 
-The plugin runs on GPU nodes and interacts with host-level components.
-
-In production, avoid granting permissions beyond what's required.
-
-The process needs access to:
+The plugin doesn't currently select GPUs based on:
 
 ```text
-/var/lib/kubelet/device-plugins
+NUMA
+PCIe topology
+NVLink
+NVSwitch
 ```
 
-and the host NVIDIA/NVML stack.
-
-If deployed as a DaemonSet, host mounts and container privileges should be kept as narrow as possible.
-
-Don't expose the Device Plugin socket directory to unrelated workloads.
-
-The Kubernetes Device Plugin API is a node-local control-plane interface and should be treated accordingly.
+`GetPreferredAllocationAvailable` is disabled.
 
 ---
 
-# Production Deployment
+## No PreStart Requirement
 
-For production use, the plugin should normally run as a DaemonSet on GPU nodes rather than as a manually launched binary.
+The plugin doesn't require `PreStartContainer`.
 
-Typical deployment model:
-
-```text
-K8s Cluster
-    |
-    +---- CPU Node
-    |
-    +---- CPU Node
-    |
-    +---- GPU Node
-    |       |
-    |       └── k8s-gpu-device-plugin Pod
-    |
-    +---- GPU Node
-            |
-            └── k8s-gpu-device-plugin Pod
-```
-
-The DaemonSet should only target NVIDIA GPU nodes.
-
-Typical mechanisms include:
-
-```text
-nodeSelector
-nodeAffinity
-taints/tolerations
-```
-
-The plugin container needs the host Device Plugin directory mounted:
-
-```text
-/var/lib/kubelet/device-plugins
-```
-
-It also needs access to the NVIDIA driver/NVML environment required by the container runtime.
-
-Before rolling it out cluster-wide, validate the binary directly on a single GPU node.
-
-Recommended rollout:
-
-```text
-1. Build
-2. Run go vet
-3. Run tests
-4. Test on one GPU node
-5. Verify CDI
-6. Verify Capacity/Allocatable
-7. Run a single-GPU Pod
-8. Run a multi-GPU Pod
-9. Restart kubelet and verify re-registration
-10. Deploy as a DaemonSet
-```
+`PreStartRequired` is disabled.
 
 ---
 
-# Quick Start
+## Resource Domain Validation
 
-## 1. Verify the GPU
+Resource suffixes are validated, but the configured resource domain should still be treated as operator-controlled configuration and set to a valid Kubernetes extended-resource domain.
+
+---
+
+## Official NVIDIA Device Plugin Coexistence
+
+Care is required if another Device Plugin advertises the same physical GPUs under a different Kubernetes resource.
+
+For example:
+
+```text
+nvidia.com/gpu
+```
+
+and:
+
+```text
+gpu.local/rtx-3060-ti
+```
+
+are different extended resources from Kubernetes' perspective.
+
+Kubernetes doesn't inherently know that both resource names may represent the same physical GPU.
+
+Running independent plugins that advertise the same hardware can therefore create double-allocation risk.
+
+Use one authoritative allocation model for a physical GPU set unless explicit coordination exists between plugins.
+
+---
+
+# Deployment Considerations
+
+The plugin should normally run as a DaemonSet on NVIDIA GPU nodes.
+
+For a heterogeneous cluster:
+
+```text
+Control Plane
+     |
+     +----------------------------------+
+     |                                  |
+     v                                  v
+
+GPU Node A                         GPU Node B
+RTX 3060 Ti                       A100
+     |                                  |
+plugin Pod                         plugin Pod
+     |                                  |
+gpu.local/rtx-3060-ti: 1          gpu.local/a100: 1
+```
+
+The scheduler can then place model-specific workloads using the normal extended-resource mechanism.
+
+For larger deployments, consider adding:
+
+```text
+nodeSelector / nodeAffinity
+taints and tolerations
+immutable image tags
+resource requests/limits for the plugin Pod
+securityContext hardening
+portable NVIDIA runtime integration
+```
+
+The current DaemonSet uses privileged execution. This is convenient during development but should be reviewed and reduced to the minimum host permissions required before production rollout.
+
+---
+
+# End-to-End Validation
+
+A successful deployment should be validated at several levels.
+
+## 1. Plugin Pod
+
+```bash
+kubectl get pods -A -l app=k8s-gpu-device-plugin -o wide
+```
+
+## 2. Discovery
+
+Plugin logs should contain entries similar to:
+
+```text
+discovered GPU model="NVIDIA GeForce RTX 3060 Ti" uuid=GPU-... resource=gpu.local/rtx-3060-ti cdi=nvidia.com/gpu=GPU-...
+```
+
+## 3. kubelet Registration
+
+Logs should contain:
+
+```text
+registered resource=gpu.local/rtx-3060-ti socket=/var/lib/kubelet/device-plugins/k8s-gpu-rtx-3060-ti.sock devices=1
+```
+
+## 4. Node Capacity
+
+```bash
+kubectl get node <node-name> -o json | jq '.status.capacity, .status.allocatable'
+```
+
+Expected example:
+
+```text
+gpu.local/gtx-1660-super: 1
+gpu.local/rtx-3060-ti:    1
+```
+
+## 5. Real Workload Allocation
+
+Create a Pod requesting:
+
+```yaml
+resources:
+  limits:
+    gpu.local/rtx-3060-ti: 1
+```
+
+and execute:
 
 ```bash
 nvidia-smi -L
 ```
 
-## 2. Verify CDI
+inside the workload.
 
-```bash
-nvidia-ctk cdi list
+A successful end-to-end allocation produces output such as:
+
+```text
+GPU 0: NVIDIA GeForce RTX 3060 Ti (UUID: GPU-...)
 ```
 
-## 3. Build
+At that point the following path has been validated:
 
-```bash
-go mod tidy
-go vet ./...
-go test ./...
-go build -o k8s-gpu-device-plugin .
+```text
+GitHub
+   |
+   v
+GitHub Actions
+   |
+   v
+Go build + tests
+   |
+   v
+container image
+   |
+   v
+GHCR
+   |
+   v
+Kubernetes DaemonSet
+   |
+   v
+NVML discovery
+   |
+   v
+kubelet registration
+   |
+   v
+extended resource
+   |
+   v
+Pod request
+   |
+   v
+Allocate()
+   |
+   v
+CDI
+   |
+   v
+correct physical GPU inside container
 ```
-
-## 4. Run
-
-```bash
-sudo GPU_RESOURCE_DOMAIN=gpu.local ./k8s-gpu-device-plugin
-```
-
-## 5. Verify K8s resources
-
-```bash
-kubectl get node <node-name> -o json | jq '.status.allocatable'
-```
-
-Example:
-
-```json
-{
-  "gpu.local/gtx-1660-super": "1",
-  "gpu.local/rtx-3060-ti": "1"
-}
-```
-
-## 6. Request a GPU
-
-```yaml
-apiVersion: v1
-kind: Pod
-
-metadata:
-  name: gpu-test
-
-spec:
-  restartPolicy: Never
-
-  containers:
-    - name: cuda
-      image: nvidia/cuda:12.1.0-base-ubuntu22.04
-      command: ["bash", "-c", "nvidia-smi -L"]
-
-      resources:
-        limits:
-          gpu.local/rtx-3060-ti: 1
-```
-
-Apply:
-
-```bash
-kubectl apply -f pod.yaml
-```
-
-Check:
-
-```bash
-kubectl logs gpu-test
-```
-
-The workload should see the GPU model it requested.
 
 ---
 
 # Design Summary
 
-The plugin intentionally keeps GPU identity and K8s resource identity separate.
+The design separates three different identities.
 
-A physical device is identified by its immutable GPU UUID:
+## Scheduler Identity
+
+The GPU model is represented as a Kubernetes extended resource:
 
 ```text
-GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+gpu.local/rtx-3060-ti
 ```
 
-The scheduler-facing resource represents a GPU model:
+This is what workloads request.
+
+## Physical Identity
+
+The actual GPU is identified by its NVIDIA UUID:
 
 ```text
-gpu.local/rtx-4090
+GPU-c0a1bd7d-9471-1ea3-0e5d-fbaead894758
 ```
 
-CDI bridges the physical GPU into the container:
+This is what the Device Plugin tracks and kubelet allocates.
+
+## Container Identity
+
+The selected GPU is passed to the container runtime as a CDI device:
 
 ```text
-nvidia.com/gpu=<UUID>
+nvidia.com/gpu=GPU-c0a1bd7d-9471-1ea3-0e5d-fbaead894758
 ```
 
-So the complete mapping is:
+The complete mapping is therefore:
 
 ```text
-GPU Model
-   |
-   v
-K8s Extended Resource
-   |
-   v
+NVIDIA GPU Model
+        |
+        v
+Kubernetes Extended Resource
+        |
+        v
+Scheduler selects Node
+        |
+        v
 kubelet selects Device ID
-   |
-   v
+        |
+        v
 Physical GPU UUID
-   |
-   v
+        |
+        v
+Device Plugin Allocate()
+        |
+        v
 NVIDIA CDI Device
-   |
-   v
-Container
+        |
+        v
+Container Runtime
+        |
+        v
+Workload
 ```
 
-This gives K8s model-aware GPU scheduling while preserving UUID-level allocation and isolation.
+This provides model-aware Kubernetes GPU scheduling while preserving UUID-level physical device allocation and CDI-based container injection.

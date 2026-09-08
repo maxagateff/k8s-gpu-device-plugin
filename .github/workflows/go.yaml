@@ -1,0 +1,82 @@
+name: build
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: set-up-go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: true
+          cache-dependency-path: src/go.sum
+
+      - name: verify-dependencies
+        run: go mod verify
+        working-directory: src
+
+      - name: vet
+        run: go vet ./...
+        working-directory: src
+
+      - name: test
+        run: go test ./...
+        working-directory: src
+
+      - name: build-binary
+        run: go build -v -o k8s-gpu-device-plugin .
+        working-directory: src
+
+  image:
+    name: build-container-image
+    runs-on: ubuntu-latest
+    needs: test
+
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: log-in-to-GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: set-image-name
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: build-image
+        run: |
+          docker build \
+            -t "$IMAGE:${GITHUB_SHA}" \
+            -t "$IMAGE:latest" \
+            .
+
+      - name: push-image
+        run: |
+          docker push "$IMAGE:${GITHUB_SHA}"
+          docker push "$IMAGE:latest"
