@@ -3,7 +3,7 @@ kind: DaemonSet
 
 metadata:
   name: k8s-gpu-device-plugin
-  namespace: kube-system
+  namespace: gpu-operator
 
 spec:
   selector:
@@ -23,7 +23,7 @@ spec:
 
           env:
             - name: GPU_RESOURCE_DOMAIN
-              value: gpu.local
+              value: agm
 
             - name: GPU_PLUGIN_PATH
               value: /var/lib/kubelet/device-plugins
@@ -65,5 +65,5 @@ spec:
 
         - name: nvidia-ml
           hostPath:
-              path: /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
-              type: File
+            path: /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+            type: File
