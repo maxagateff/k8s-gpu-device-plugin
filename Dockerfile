@@ -7,9 +7,9 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-go build -trimpath -ldflags="-s -w" \
--o /out/k8s-gpu-device-plugin .
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /out/k8s-gpu-device-plugin .
 
 FROM ubuntu:24.04
 
