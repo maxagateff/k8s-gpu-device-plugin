@@ -43,6 +43,10 @@ spec:
               mountPath: /var/run/cdi
               readOnly: true
 
+            - name: nvidia-ml
+              mountPath: /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+              readOnly: true
+
       volumes:
         - name: device-plugins
           hostPath:
@@ -58,3 +62,8 @@ spec:
           hostPath:
             path: /var/run/cdi
             type: DirectoryOrCreate
+
+        - name: nvidia-ml
+          hostPath:
+              path: /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+              type: File
