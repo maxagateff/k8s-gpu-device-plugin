@@ -34,15 +34,19 @@ jobs:
 
       - name: verify-dependencies
         run: go mod verify
+        working-directory: src
 
       - name: vet
         run: go vet ./...
+        working-directory: src
 
       - name: test
         run: go test ./...
+        working-directory: src
 
       - name: build-binary
         run: go build -v -o k8s-gpu-device-plugin .
+        working-directory: src
 
   image:
     name: build-container-image
