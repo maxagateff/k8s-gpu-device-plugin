@@ -5,7 +5,7 @@ WORKDIR /src
 COPY src/go.mod src/go.sum ./
 RUN go mod download
 
-COPY . .
+COPY src/ ./
 
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" \
