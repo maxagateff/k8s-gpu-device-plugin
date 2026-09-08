@@ -29,9 +29,9 @@ jobs:
       - name: set-up-go
         uses: actions/setup-go@v5
         with:
-          go-version-file: src/go.mod # 👈 Updated path to the src folder
+          go-version-file: src/go.mod 
           cache: true
-          cache-dependency-path: src/go.sum # 👈 Added to ensure caching works correctly
+          cache-dependency-path: src/go.sum
 
       - name: verify-dependencies
         run: go mod verify
