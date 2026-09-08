@@ -31,3 +31,4 @@ go.work.sum
 # Editor/IDE
 # .vscode/
 !/.idea/
+!/.idea.mv/
